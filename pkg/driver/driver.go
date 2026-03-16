@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/google/cel-go/cel"
@@ -33,6 +34,7 @@ import (
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
 	"k8s.io/dynamic-resource-allocation/resourceslice"
 	"k8s.io/klog/v2"
@@ -81,10 +83,18 @@ func WithInventory(db inventoryDB) Option {
 	}
 }
 
+// WithRESTConfig sets the Kubernetes REST config used by auxiliary clients.
+func WithRESTConfig(restConfig *rest.Config) Option {
+	return func(o *NetworkDriver) {
+		o.restConfig = restConfig
+	}
+}
+
 type NetworkDriver struct {
 	driverName string
 	nodeName   string
 	kubeClient kubernetes.Interface
+	restConfig *rest.Config
 	draPlugin  pluginHelper
 	nriPlugin  stub.Stub
 
@@ -95,6 +105,9 @@ type NetworkDriver struct {
 	// Cache the rdma shared mode state
 	rdmaSharedMode bool
 	podConfigStore *PodConfigStore
+
+	ipamMu        sync.Mutex
+	ipamProviders map[string]ipamProvider
 }
 
 type Option func(*NetworkDriver)

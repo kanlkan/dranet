@@ -51,6 +51,10 @@ type InterfaceConfig struct {
 	// This is mutually exclusive with the 'addresses' field.
 	DHCP *bool `json:"dhcp,omitempty"`
 
+	// IPAM describes dynamic address management settings.
+	// This is mutually exclusive with both `addresses` and `dhcp`.
+	IPAM *IPAMConfig `json:"ipam,omitempty"`
+
 	// MTU is the Maximum Transmission Unit for the interface.
 	MTU *int32 `json:"mtu,omitempty"`
 
@@ -76,6 +80,34 @@ type InterfaceConfig struct {
 	// DisableEBPFPrograms, if true, attempts to detach all eBPF programs
 	// (both TC and TCX) from the network interface assigned to the Pod.
 	DisableEBPFPrograms *bool `json:"disableEbpfPrograms,omitempty"`
+}
+
+// IPAMConfig represents dynamic IPAM settings for an interface.
+type IPAMConfig struct {
+	// Type selects the IPAM provider.
+	// Currently supported values: "whereabouts".
+	Type string `json:"type,omitempty"`
+
+	// Whereabouts holds provider-specific configuration when type is "whereabouts".
+	Whereabouts *WhereaboutsConfig `json:"whereabouts,omitempty"`
+}
+
+// WhereaboutsConfig defines a dynamic range used for IP allocation.
+type WhereaboutsConfig struct {
+	// Range is the parent CIDR used as the allocation range.
+	Range string `json:"range"`
+
+	// RangeStart optionally sets the first assignable IP in Range.
+	RangeStart string `json:"rangeStart,omitempty"`
+
+	// RangeEnd optionally sets the last assignable IP in Range.
+	RangeEnd string `json:"rangeEnd,omitempty"`
+
+	// Exclude is a list of CIDRs or single IPs to be skipped during allocation.
+	Exclude []string `json:"exclude,omitempty"`
+
+	// NetworkName scopes pool naming for the same CIDR across different virtual networks.
+	NetworkName string `json:"networkName,omitempty"`
 }
 
 // RouteConfig represents a network route configuration.

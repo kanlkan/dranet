@@ -47,6 +47,23 @@ rules:
     verbs:
       - patch
       - update
+  - apiGroups:
+      - "whereabouts.cni.cncf.io"
+    resources:
+      - ippools
+    verbs:
+      - get
+      - list
+      - create
+      - patch
+  - apiGroups:
+      - "whereabouts.cni.cncf.io"
+    resources:
+      - overlappingrangeipreservations
+    verbs:
+      - get
+      - create
+      - delete
 ---
 kind: ClusterRoleBinding
 apiVersion: rbac.authorization.k8s.io/v1

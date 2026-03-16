@@ -144,12 +144,18 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 	}()
 	// TODO: shared devices may allocate the same device to multiple pods, i.e. macvlan, ipvlan, ...
 	podUIDs := []types.UID{}
+	podRefsByUID := map[types.UID]string{}
 	for _, reserved := range claim.Status.ReservedFor {
 		if reserved.Resource != "pods" || reserved.APIGroup != "" {
 			klog.Infof("Driver only supports Pods, unsupported reference %#v", reserved)
 			continue
 		}
 		podUIDs = append(podUIDs, reserved.UID)
+		podName := reserved.Name
+		if podName == "" {
+			podName = string(reserved.UID)
+		}
+		podRefsByUID[reserved.UID] = fmt.Sprintf("%s/%s", claim.Namespace, podName)
 	}
 	if len(podUIDs) == 0 {
 		klog.Infof("no pods allocated to claim %s/%s", claim.Namespace, claim.Name)
@@ -241,9 +247,11 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 			podCfg.NetworkInterfaceConfigInPod.Interface.Name = ifName
 		}
 
+		useDynamicIPAM := podCfg.NetworkInterfaceConfigInPod.Interface.IPAM != nil
+
 		// If DHCP is requested, do a DHCP request to gather the network parameters (IPs and Routes)
 		// ... but we DO NOT apply them in the root namespace
-		if podCfg.NetworkInterfaceConfigInPod.Interface.DHCP != nil && *podCfg.NetworkInterfaceConfigInPod.Interface.DHCP {
+		if !useDynamicIPAM && podCfg.NetworkInterfaceConfigInPod.Interface.DHCP != nil && *podCfg.NetworkInterfaceConfigInPod.Interface.DHCP {
 			klog.V(2).Infof("trying to get network configuration via DHCP")
 			contextCancel, cancel := context.WithTimeout(ctx, 5*time.Second)
 			defer cancel()
@@ -254,7 +262,7 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 				podCfg.NetworkInterfaceConfigInPod.Interface.Addresses = []string{ip}
 				podCfg.NetworkInterfaceConfigInPod.Routes = append(podCfg.NetworkInterfaceConfigInPod.Routes, routes...)
 			}
-		} else if len(podCfg.NetworkInterfaceConfigInPod.Interface.Addresses) == 0 {
+		} else if !useDynamicIPAM && len(podCfg.NetworkInterfaceConfigInPod.Interface.Addresses) == 0 {
 			// If there is no custom addresses and no DHCP, then use the existing ones
 			// get the existing IP addresses
 			nlAddresses, err := nlHandle.AddrList(link, netlink.FAMILY_ALL)
@@ -368,6 +376,70 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 			}
 		}
 
+		if useDynamicIPAM {
+			providerType := podCfg.NetworkInterfaceConfigInPod.Interface.IPAM.Type
+			provider, err := np.getIPAMProvider(providerType)
+			if err != nil {
+				errorList = append(errorList, fmt.Errorf("failed to initialize ipam provider %q: %w", providerType, err))
+				continue
+			}
+
+			type podAllocation struct {
+				uid types.UID
+				cfg PodConfig
+			}
+			allocations := []podAllocation{}
+			allocErr := false
+			for _, uid := range podUIDs {
+				podRef := podRefsByUID[uid]
+				if podRef == "" {
+					podRef = fmt.Sprintf("%s/%s", claim.Namespace, uid)
+				}
+
+				podSpecificCfg := podCfg
+				allocationResult, err := provider.Allocate(ctx, ipamAllocateRequest{
+					ClaimUID:   claim.UID,
+					Namespace:  claim.Namespace,
+					PodUID:     uid,
+					PodRef:     podRef,
+					DeviceName: result.Device,
+					IfName:     podSpecificCfg.NetworkInterfaceConfigInPod.Interface.Name,
+					IPAM:       *podSpecificCfg.NetworkInterfaceConfigInPod.Interface.IPAM,
+				})
+				if err != nil {
+					errorList = append(errorList, fmt.Errorf("failed to allocate dynamic IP for pod %s and device %s: %w", uid, result.Device, err))
+					allocErr = true
+					break
+				}
+				podSpecificCfg.NetworkInterfaceConfigInPod.Interface.Addresses = allocationResult.Addresses
+				podSpecificCfg.IPAMAllocation = &allocationResult.Lease
+				allocations = append(allocations, podAllocation{uid: uid, cfg: podSpecificCfg})
+			}
+
+			if allocErr {
+				for _, allocation := range allocations {
+					if allocation.cfg.IPAMAllocation == nil || allocation.cfg.NetworkInterfaceConfigInPod.Interface.IPAM == nil {
+						continue
+					}
+					if releaseErr := provider.Release(ctx, ipamReleaseRequest{
+						Namespace: claim.Namespace,
+						IfName:    allocation.cfg.NetworkInterfaceConfigInPod.Interface.Name,
+						IPAM:      *allocation.cfg.NetworkInterfaceConfigInPod.Interface.IPAM,
+						Lease:     *allocation.cfg.IPAMAllocation,
+					}); releaseErr != nil {
+						errorList = append(errorList, fmt.Errorf("failed to rollback dynamic IP for pod %s and device %s: %w", allocation.uid, result.Device, releaseErr))
+					}
+				}
+				continue
+			}
+
+			for _, allocation := range allocations {
+				np.podConfigStore.Set(allocation.uid, result.Device, allocation.cfg)
+				klog.V(4).Infof("Claim Resources for pod %s : %#v", allocation.uid, allocation.cfg)
+			}
+			continue
+		}
+
 		// TODO: support for multiple pods sharing the same device
 		// we'll create the subinterface here
 		for _, uid := range podUIDs {
@@ -428,9 +500,30 @@ func (np *NetworkDriver) unprepareResourceClaims(ctx context.Context, claims []k
 	return result, nil
 }
 
-func (np *NetworkDriver) unprepareResourceClaim(_ context.Context, claim kubeletplugin.NamespacedObject) error {
+func (np *NetworkDriver) unprepareResourceClaim(ctx context.Context, claim kubeletplugin.NamespacedObject) error {
+	configs := np.podConfigStore.GetClaimConfigs(claim.NamespacedName)
+	var errorList []error
+	for _, cfg := range configs {
+		if cfg.IPAMAllocation == nil || cfg.NetworkInterfaceConfigInPod.Interface.IPAM == nil {
+			continue
+		}
+		provider, err := np.getIPAMProvider(cfg.IPAMAllocation.Provider)
+		if err != nil {
+			errorList = append(errorList, fmt.Errorf("failed to initialize ipam provider %q: %w", cfg.IPAMAllocation.Provider, err))
+			continue
+		}
+		if err := provider.Release(ctx, ipamReleaseRequest{
+			Namespace: claim.Namespace,
+			IfName:    cfg.NetworkInterfaceConfigInPod.Interface.Name,
+			IPAM:      *cfg.NetworkInterfaceConfigInPod.Interface.IPAM,
+			Lease:     *cfg.IPAMAllocation,
+		}); err != nil {
+			errorList = append(errorList, fmt.Errorf("failed to release dynamic IP for claim %s/%s: %w", claim.Namespace, claim.Name, err))
+		}
+	}
+
 	np.podConfigStore.DeleteClaim(claim.NamespacedName)
-	return nil
+	return errors.Join(errorList...)
 }
 
 func (np *NetworkDriver) HandleError(ctx context.Context, err error, msg string) {

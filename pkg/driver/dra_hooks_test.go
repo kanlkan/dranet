@@ -30,6 +30,20 @@ import (
 	"sigs.k8s.io/dranet/pkg/apis"
 )
 
+type fakeIPAMProvider struct {
+	releaseCalls int
+	releaseErr   error
+}
+
+func (f *fakeIPAMProvider) Allocate(_ context.Context, _ ipamAllocateRequest) (ipamAllocateResult, error) {
+	return ipamAllocateResult{}, nil
+}
+
+func (f *fakeIPAMProvider) Release(_ context.Context, _ ipamReleaseRequest) error {
+	f.releaseCalls++
+	return f.releaseErr
+}
+
 func TestPublishResourcesPrometheusMetrics(t *testing.T) {
 	testCases := []struct {
 		name          string
@@ -238,6 +252,51 @@ func TestUnprepareResourceClaimsMetrics(t *testing.T) {
 			t.Fatalf("CollectAndCompare failed: %v", err)
 		}
 	})
+}
+
+func TestUnprepareResourceClaimReleasesDynamicIPAMLeases(t *testing.T) {
+	claimName := types.NamespacedName{Name: "claim", Namespace: "ns"}
+	provider := &fakeIPAMProvider{}
+	np := &NetworkDriver{
+		podConfigStore: NewPodConfigStore(),
+		ipamProviders: map[string]ipamProvider{
+			apis.IPAMTypeWhereabouts: provider,
+		},
+	}
+
+	np.podConfigStore.Set("pod-uid", "device-a", PodConfig{
+		Claim: claimName,
+		NetworkInterfaceConfigInPod: apis.NetworkConfig{
+			Interface: apis.InterfaceConfig{
+				Name: "eth0",
+				IPAM: &apis.IPAMConfig{
+					Type: apis.IPAMTypeWhereabouts,
+					Whereabouts: &apis.WhereaboutsConfig{
+						Range: "10.0.0.0/24",
+					},
+				},
+			},
+		},
+		IPAMAllocation: &IPAMAllocation{
+			Provider:    apis.IPAMTypeWhereabouts,
+			ContainerID: "claim/pod/device-a",
+			PodRef:      "ns/pod",
+		},
+	})
+
+	err := np.unprepareResourceClaim(context.Background(), kubeletplugin.NamespacedObject{
+		NamespacedName: claimName,
+		UID:            "claim-uid",
+	})
+	if err != nil {
+		t.Fatalf("unprepareResourceClaim returned error: %v", err)
+	}
+	if provider.releaseCalls != 1 {
+		t.Errorf("expected release to be called once, got %d", provider.releaseCalls)
+	}
+	if _, ok := np.podConfigStore.GetPodConfigs("pod-uid"); ok {
+		t.Errorf("pod config should be deleted after unprepare")
+	}
 }
 
 func TestPublishResourcesMetrics(t *testing.T) {

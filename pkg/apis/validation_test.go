@@ -284,6 +284,82 @@ func TestValidateInterfaceConfig(t *testing.T) {
 			expectErr: false,
 		},
 		{
+			name: "valid whereabouts ipam",
+			cfg: &InterfaceConfig{
+				Name: "eth0",
+				IPAM: &IPAMConfig{
+					Type: IPAMTypeWhereabouts,
+					Whereabouts: &WhereaboutsConfig{
+						Range:      "10.0.0.0/24",
+						RangeStart: "10.0.0.10",
+						RangeEnd:   "10.0.0.200",
+						Exclude:    []string{"10.0.0.1/32", "10.0.0.0/30"},
+					},
+				},
+			},
+			fieldPath: "iface",
+			expectErr: false,
+		},
+		{
+			name: "invalid with ipam and addresses",
+			cfg: &InterfaceConfig{
+				Name:      "eth0",
+				Addresses: []string{"10.0.0.2/24"},
+				IPAM: &IPAMConfig{
+					Type: IPAMTypeWhereabouts,
+					Whereabouts: &WhereaboutsConfig{
+						Range: "10.0.0.0/24",
+					},
+				},
+			},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name: "invalid with ipam and dhcp",
+			cfg: &InterfaceConfig{
+				Name: "eth0",
+				DHCP: ptr.To(true),
+				IPAM: &IPAMConfig{
+					Type: IPAMTypeWhereabouts,
+					Whereabouts: &WhereaboutsConfig{
+						Range: "10.0.0.0/24",
+					},
+				},
+			},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name: "invalid ipam type",
+			cfg: &InterfaceConfig{
+				Name: "eth0",
+				IPAM: &IPAMConfig{
+					Type: "other",
+				},
+			},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
+			name: "invalid whereabouts range",
+			cfg: &InterfaceConfig{
+				Name: "eth0",
+				IPAM: &IPAMConfig{
+					Type: IPAMTypeWhereabouts,
+					Whereabouts: &WhereaboutsConfig{
+						Range: "invalid",
+					},
+				},
+			},
+			fieldPath: "iface",
+			expectErr: true,
+			errCount:  1,
+		},
+		{
 			name:      "multiple errors",
 			cfg:       &InterfaceConfig{Name: "eth/0", Addresses: []string{"badip"}, MTU: ptr.To[int32](0)},
 			fieldPath: "iface",

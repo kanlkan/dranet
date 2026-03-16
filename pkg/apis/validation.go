@@ -33,6 +33,8 @@ const (
 	MinMTU = 68
 	// MaxInterfaceNameLen is typically IFNAMSIZ-1 (usually 15 on Linux).
 	MaxInterfaceNameLen = 15
+	// IPAMTypeWhereabouts is the currently supported dynamic IPAM provider.
+	IPAMTypeWhereabouts = "whereabouts"
 )
 
 // ValidateConfig unmarshals and validates the NetworkConfig from a runtime.RawExtension.
@@ -142,6 +144,16 @@ func validateInterfaceConfig(cfg *InterfaceConfig, fieldPath string) (allErrors 
 		allErrors = append(allErrors, fmt.Errorf("%s: dhcp and addresses are mutually exclusive", fieldPath))
 	}
 
+	if cfg.IPAM != nil {
+		if len(cfg.Addresses) > 0 {
+			allErrors = append(allErrors, fmt.Errorf("%s: ipam and addresses are mutually exclusive", fieldPath))
+		}
+		if cfg.DHCP != nil && *cfg.DHCP {
+			allErrors = append(allErrors, fmt.Errorf("%s: ipam and dhcp are mutually exclusive", fieldPath))
+		}
+		allErrors = append(allErrors, validateIPAMConfig(cfg.IPAM, fieldPath+".ipam")...)
+	}
+
 	if cfg.MTU != nil {
 		if *cfg.MTU < MinMTU {
 			allErrors = append(allErrors, fmt.Errorf("%s.mtu: must be at least %d, got %d", fieldPath, MinMTU, *cfg.MTU))
@@ -168,6 +180,73 @@ func validateInterfaceConfig(cfg *InterfaceConfig, fieldPath string) (allErrors 
 
 	if cfg.GROIPv4MaxSize != nil && *cfg.GROIPv4MaxSize <= 0 {
 		allErrors = append(allErrors, fmt.Errorf("%s.grov4MaxSize: must be positive, got %d", fieldPath, *cfg.GROIPv4MaxSize))
+	}
+
+	return allErrors
+}
+
+func validateIPAMConfig(cfg *IPAMConfig, fieldPath string) (allErrors []error) {
+	if cfg == nil {
+		return nil
+	}
+
+	switch cfg.Type {
+	case IPAMTypeWhereabouts:
+		if cfg.Whereabouts == nil {
+			allErrors = append(allErrors, fmt.Errorf("%s.whereabouts: must be specified when type is %q", fieldPath, IPAMTypeWhereabouts))
+			return allErrors
+		}
+		allErrors = append(allErrors, validateWhereaboutsConfig(cfg.Whereabouts, fieldPath+".whereabouts")...)
+	default:
+		if cfg.Type == "" {
+			allErrors = append(allErrors, fmt.Errorf("%s.type: cannot be empty", fieldPath))
+		} else {
+			allErrors = append(allErrors, fmt.Errorf("%s.type: unsupported type %q", fieldPath, cfg.Type))
+		}
+	}
+
+	return allErrors
+}
+
+func validateWhereaboutsConfig(cfg *WhereaboutsConfig, fieldPath string) (allErrors []error) {
+	if cfg == nil {
+		return nil
+	}
+
+	_, subnet, err := net.ParseCIDR(cfg.Range)
+	if err != nil {
+		allErrors = append(allErrors, fmt.Errorf("%s.range: invalid CIDR format %q", fieldPath, cfg.Range))
+		return allErrors
+	}
+
+	var rangeStartIP net.IP
+	if cfg.RangeStart != "" {
+		rangeStartIP = net.ParseIP(cfg.RangeStart)
+		if rangeStartIP == nil {
+			allErrors = append(allErrors, fmt.Errorf("%s.rangeStart: invalid IP format %q", fieldPath, cfg.RangeStart))
+		} else if !subnet.Contains(rangeStartIP) {
+			allErrors = append(allErrors, fmt.Errorf("%s.rangeStart: IP %q is outside range %q", fieldPath, cfg.RangeStart, cfg.Range))
+		}
+	}
+
+	var rangeEndIP net.IP
+	if cfg.RangeEnd != "" {
+		rangeEndIP = net.ParseIP(cfg.RangeEnd)
+		if rangeEndIP == nil {
+			allErrors = append(allErrors, fmt.Errorf("%s.rangeEnd: invalid IP format %q", fieldPath, cfg.RangeEnd))
+		} else if !subnet.Contains(rangeEndIP) {
+			allErrors = append(allErrors, fmt.Errorf("%s.rangeEnd: IP %q is outside range %q", fieldPath, cfg.RangeEnd, cfg.Range))
+		}
+	}
+
+	if rangeStartIP != nil && rangeEndIP != nil && netip.MustParseAddr(rangeStartIP.String()).Compare(netip.MustParseAddr(rangeEndIP.String())) > 0 {
+		allErrors = append(allErrors, fmt.Errorf("%s: rangeStart %q must be <= rangeEnd %q", fieldPath, cfg.RangeStart, cfg.RangeEnd))
+	}
+
+	for i, exclude := range cfg.Exclude {
+		if _, _, err := net.ParseCIDR(exclude); err != nil && net.ParseIP(exclude) == nil {
+			allErrors = append(allErrors, fmt.Errorf("%s.exclude[%d]: invalid CIDR or IP format %q", fieldPath, i, exclude))
+		}
 	}
 
 	return allErrors

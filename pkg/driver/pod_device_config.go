@@ -42,6 +42,9 @@ type PodConfig struct {
 	// RDMADevice holds RDMA-specific configurations if the network device
 	// has associated RDMA capabilities.
 	RDMADevice RDMAConfig
+
+	// IPAMAllocation holds dynamic IPAM lease metadata for release.
+	IPAMAllocation *IPAMAllocation
 }
 
 // RDMAConfig contains parameters for setting up an RDMA device associated
@@ -65,6 +68,12 @@ type LinuxDevice struct {
 	FileMode uint32
 	UID      uint32
 	GID      uint32
+}
+
+type IPAMAllocation struct {
+	Provider    string
+	ContainerID string
+	PodRef      string
 }
 
 // PodConfigStore provides a thread-safe, centralized store for all network device configurations
@@ -147,4 +156,20 @@ func (s *PodConfigStore) DeleteClaim(claim types.NamespacedName) {
 	for _, uid := range podsToDelete {
 		delete(s.configs, uid)
 	}
+}
+
+// GetClaimConfigs returns all stored device configs associated with a claim.
+func (s *PodConfigStore) GetClaimConfigs(claim types.NamespacedName) []PodConfig {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var out []PodConfig
+	for _, podConfigsMap := range s.configs {
+		for _, config := range podConfigsMap {
+			if config.Claim == claim {
+				out = append(out, config)
+			}
+		}
+	}
+	return out
 }

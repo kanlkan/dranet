@@ -1,0 +1,26 @@
+# Platform/admin side (cluster-scoped):
+# DeviceClass contains the hidden DRANET + whereabouts configuration.
+apiVersion: resource.k8s.io/v1
+kind: DeviceClass
+metadata:
+  name: dranet-whereabouts-sriovvfs
+spec:
+  selectors:
+    - cel:
+        expression: device.driver == "dra.net"
+    - cel:
+        expression: device.attributes["dra.net"].pciDevice.contains("Virtual Function")
+  config:
+    - opaque:
+        driver: dra.net
+        parameters:
+          interface:
+            ipam:
+              type: whereabouts
+              whereabouts:
+                range: 192.168.131.0/24
+                rangeStart: 192.168.131.119
+                rangeEnd: 192.168.131.124
+                exclude:
+                  - 192.168.131.120
+                networkName: red-network

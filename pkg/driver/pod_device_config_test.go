@@ -293,6 +293,32 @@ func TestPodConfigStore_DeleteClaim(t *testing.T) {
 	}
 }
 
+func TestPodConfigStore_GetClaimConfigs(t *testing.T) {
+	store := NewPodConfigStore()
+	claim1 := types.NamespacedName{Namespace: "ns1", Name: "claim1"}
+	claim2 := types.NamespacedName{Namespace: "ns1", Name: "claim2"}
+
+	config1 := PodConfig{Claim: claim1, NetworkInterfaceConfigInPod: apis.NetworkConfig{Interface: apis.InterfaceConfig{Name: "pod1dev1"}}}
+	config2 := PodConfig{Claim: claim1, NetworkInterfaceConfigInPod: apis.NetworkConfig{Interface: apis.InterfaceConfig{Name: "pod2dev1"}}}
+	config3 := PodConfig{Claim: claim2, NetworkInterfaceConfigInPod: apis.NetworkConfig{Interface: apis.InterfaceConfig{Name: "pod3dev1"}}}
+
+	store.Set("pod1", "dev1", config1)
+	store.Set("pod2", "dev1", config2)
+	store.Set("pod3", "dev1", config3)
+
+	configs := store.GetClaimConfigs(claim1)
+	if len(configs) != 2 {
+		t.Errorf("expected 2 configs for claim1, got %d", len(configs))
+	}
+
+	want := map[string]bool{"pod1dev1": true, "pod2dev1": true}
+	for _, cfg := range configs {
+		if !want[cfg.NetworkInterfaceConfigInPod.Interface.Name] {
+			t.Errorf("unexpected config found for claim1: %+v", cfg)
+		}
+	}
+}
+
 func TestPodConfigStore_NoDuplicateDevices(t *testing.T) {
 	store := NewPodConfigStore()
 	podUID := types.UID("test-pod-uid-1")
