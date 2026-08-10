@@ -16,6 +16,43 @@ data:
       }
     }
 ---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: whereabouts-webhook
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: whereabouts-webhook-gc
+rules:
+- apiGroups: ["resource.k8s.io"]
+  resources: ["resourceclaims"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["whereabouts.cni.cncf.io"]
+  resources: ["ippools"]
+  verbs: ["get", "list", "watch", "update", "patch"]
+- apiGroups: ["whereabouts.cni.cncf.io"]
+  resources: ["overlappingrangeipreservations"]
+  verbs: ["get", "list", "watch", "delete"]
+- apiGroups: ["coordination.k8s.io"]
+  resources: ["leases"]
+  verbs: ["get", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: whereabouts-webhook-gc
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: whereabouts-webhook-gc
+subjects:
+- kind: ServiceAccount
+  name: whereabouts-webhook
+  namespace: kube-system
+---
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -31,6 +68,7 @@ spec:
         app: whereabouts-webhook
     spec:
       hostNetwork: true
+      serviceAccountName: whereabouts-webhook
       tolerations:
       - operator: Exists
         effect: NoSchedule
@@ -38,7 +76,20 @@ spec:
       - name: webhook
         image: dranet/webhook-whereabouts:test
         imagePullPolicy: Never
-        command: ["/usr/local/bin/webhook-whereabouts", "--bind-address=127.0.0.1:8080", "--cni-bin-dir=/opt/cni/bin", "--cni-conf-dir=/etc/cni/net.d"]
+        command:
+        - /usr/local/bin/webhook-whereabouts
+        args:
+        - --bind-address=127.0.0.1:8080
+        - --cni-bin-dir=/opt/cni/bin
+        - --cni-conf-dir=/etc/cni/net.d
+        - --gc-enabled=true
+        - --gc-interval=2s  # For testing only. Use an appropriate value (e.g. 1m) in production.
+        - --gc-grace-period=5s  # For testing only. Use an appropriate value (e.g. 5m) in production.
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
         volumeMounts:
         - name: cni-bin
           mountPath: /opt/cni/bin

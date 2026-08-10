@@ -18,6 +18,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -28,10 +29,15 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 	"unicode"
 
 	cnitypes "github.com/containernetworking/cni/pkg/types"
 	types100 "github.com/containernetworking/cni/pkg/types/100"
+	resourceapi "k8s.io/api/resource/v1"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"sigs.k8s.io/dranet/pkg/apis"
 	"sigs.k8s.io/dranet/pkg/cloudprovider/webhook"
 )
@@ -44,6 +50,60 @@ type cniNetConf struct {
 type Server struct {
 	binDir   string
 	profiles map[string]cniNetConf
+}
+
+type podIdentity struct {
+	Namespace string
+	Name      string
+}
+
+func podFromClaim(claim *resourceapi.ResourceClaim) (podIdentity, error) {
+	if claim == nil {
+		return podIdentity{}, fmt.Errorf("resource claim is required")
+	}
+	if claim.UID == "" {
+		return podIdentity{}, fmt.Errorf("resource claim UID is required")
+	}
+	if claim.Namespace == "" {
+		return podIdentity{}, fmt.Errorf("resource claim namespace is required")
+	}
+	if len(claim.Status.ReservedFor) != 1 {
+		return podIdentity{}, fmt.Errorf("resource claim must be reserved for exactly one Pod, got %d consumers", len(claim.Status.ReservedFor))
+	}
+	consumer := claim.Status.ReservedFor[0]
+	if consumer.APIGroup != "" || consumer.Resource != "pods" {
+		return podIdentity{}, fmt.Errorf("resource claim consumer must reference a core Pod")
+	}
+	if consumer.Name == "" || consumer.UID == "" {
+		return podIdentity{}, fmt.Errorf("resource claim Pod consumer name and UID are required")
+	}
+	return podIdentity{Namespace: claim.Namespace, Name: consumer.Name}, nil
+}
+
+func cniEnv(command, containerID, ifName string, pod podIdentity, binDir string) []string {
+	return []string{
+		"CNI_COMMAND=" + command,
+		"CNI_CONTAINERID=" + containerID,
+		"CNI_NETNS=/dev/null",
+		"CNI_IFNAME=" + ifName,
+		"CNI_PATH=" + binDir,
+		"CNI_ARGS=IgnoreUnknown=1;K8S_POD_NAMESPACE=" + pod.Namespace + ";K8S_POD_NAME=" + pod.Name + ";K8S_POD_INFRA_CONTAINER_ID=" + containerID,
+	}
+}
+
+func cniPluginFailure(output []byte, exitErr *exec.ExitError) string {
+	stdout := strings.TrimSpace(string(output))
+	stderr := strings.TrimSpace(string(exitErr.Stderr))
+	switch {
+	case stdout != "" && stderr != "":
+		return stdout + "\nstderr: " + stderr
+	case stdout != "":
+		return stdout
+	case stderr != "":
+		return stderr
+	default:
+		return exitErr.Error()
+	}
 }
 
 func (s *Server) GetDeviceAttributes(w http.ResponseWriter, r *http.Request) {
@@ -77,8 +137,7 @@ const pciNamePrefix = "pci-"
 //     ("pci-0000-27-00-2" -> "0000-27-00-2"), re-validating the result;
 //   - anything still invalid (e.g. base32-encoded names, already unreadable):
 //     a deterministic hash.
-func cniIfname(req webhook.ProfileRequest) string {
-	name := req.Device.Name
+func cniIfname(name string) string {
 	if isValidCNIIfname(name) {
 		return name
 	}
@@ -118,6 +177,11 @@ func (s *Server) GetProfileConfig(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	pod, err := podFromClaim(req.Claim)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 
 	var profileName string
 	if req.Config != nil {
@@ -131,14 +195,8 @@ func (s *Server) GetProfileConfig(w http.ResponseWriter, r *http.Request) {
 	}
 
 	binPath := filepath.Join(s.binDir, filepath.Base(conf.IPAM.Type))
-	env := []string{
-		"CNI_COMMAND=ADD",
-		"CNI_CONTAINERID=" + string(req.ClaimUID),
-		"CNI_NETNS=/dev/null", // IPAM plugins don't need network namespaces
-		"CNI_IFNAME=" + cniIfname(req),
-		"CNI_PATH=" + s.binDir,
-		"CNI_ARGS=IgnoreUnknown=1;K8S_POD_NAMESPACE=default;K8S_POD_NAME=pod-whereabouts;K8S_POD_INFRA_CONTAINER_ID=" + string(req.ClaimUID),
-	}
+	claimUID := string(req.Claim.UID)
+	env := cniEnv("ADD", claimUID, cniIfname(req.Device.Name), pod, s.binDir)
 
 	cmd := exec.Command(binPath)
 	cmd.Env = append(os.Environ(), env...)
@@ -147,7 +205,7 @@ func (s *Server) GetProfileConfig(w http.ResponseWriter, r *http.Request) {
 	output, err := cmd.Output()
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
-			http.Error(w, fmt.Sprintf("IPAM plugin %s failed: %s", conf.IPAM.Type, string(exitErr.Stderr)), http.StatusInternalServerError)
+			http.Error(w, fmt.Sprintf("IPAM plugin %s failed: %s", conf.IPAM.Type, cniPluginFailure(output, exitErr)), http.StatusInternalServerError)
 			return
 		}
 		http.Error(w, fmt.Sprintf("failed to execute IPAM plugin: %v", err), http.StatusInternalServerError)
@@ -180,9 +238,13 @@ func (s *Server) GetProfileConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) ReleaseProfileConfig(w http.ResponseWriter, r *http.Request) {
-	var req webhook.ProfileRequest
+	var req webhook.ProfileReleaseRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.ClaimUID == "" {
+		http.Error(w, "resource claim UID is required", http.StatusBadRequest)
 		return
 	}
 
@@ -198,14 +260,12 @@ func (s *Server) ReleaseProfileConfig(w http.ResponseWriter, r *http.Request) {
 	}
 
 	binPath := filepath.Join(s.binDir, filepath.Base(conf.IPAM.Type))
-	env := []string{
-		"CNI_COMMAND=DEL",
-		"CNI_CONTAINERID=" + string(req.ClaimUID),
-		"CNI_NETNS=/dev/null",
-		"CNI_IFNAME=" + cniIfname(req),
-		"CNI_PATH=" + s.binDir,
-		"CNI_ARGS=IgnoreUnknown=1;K8S_POD_NAMESPACE=default;K8S_POD_NAME=pod-whereabouts;K8S_POD_INFRA_CONTAINER_ID=" + string(req.ClaimUID),
-	}
+	// NodeUnprepareResources does not provide the full ResourceClaim, so the
+	// Pod identity is unavailable here. whereabouts releases the allocation by
+	// (CNI_CONTAINERID, CNI_IFNAME); keep the legacy placeholder CNI_ARGS for
+	// compatibility with the CNI invocation while deriving the same ifname as ADD.
+	pod := podIdentity{Namespace: "default", Name: "pod-whereabouts"}
+	env := cniEnv("DEL", string(req.ClaimUID), cniIfname(req.Device.Name), pod, s.binDir)
 
 	cmd := exec.Command(binPath)
 	cmd.Env = append(os.Environ(), env...)
@@ -232,10 +292,22 @@ func main() {
 	var bindAddress string
 	var binDir string
 	var confDir string
+	var gcEnabled bool
+	var gcInterval time.Duration
+	var gcGracePeriod time.Duration
+	var gcNamespace string
+	var gcLeaderElection bool
+	var gcLeaseName string
 
 	flag.StringVar(&bindAddress, "bind-address", ":8080", "The IP address and port for the webhook server to serve on")
 	flag.StringVar(&binDir, "cni-bin-dir", "/opt/cni/bin", "CNI binaries directory")
 	flag.StringVar(&confDir, "cni-conf-dir", "/etc/cni/net.d", "CNI config directory")
+	flag.BoolVar(&gcEnabled, "gc-enabled", false, "Enable ResourceClaim-based garbage collection for managed whereabouts IPPools")
+	flag.DurationVar(&gcInterval, "gc-interval", time.Minute, "Interval between whereabouts garbage collection scans")
+	flag.DurationVar(&gcGracePeriod, "gc-grace-period", 5*time.Minute, "How long an allocation must remain orphaned before it is collected")
+	flag.StringVar(&gcNamespace, "gc-namespace", "kube-system", "Namespace containing whereabouts IPPool resources and the GC leader-election Lease")
+	flag.BoolVar(&gcLeaderElection, "gc-leader-election", true, "Use a Kubernetes Lease so only one webhook instance runs garbage collection")
+	flag.StringVar(&gcLeaseName, "gc-lease-name", "dranet-webhook-whereabouts-gc", "Name of the garbage collector leader-election Lease")
 	flag.Parse()
 
 	if stat, err := os.Stat(binDir); err != nil || !stat.IsDir() {
@@ -287,6 +359,34 @@ func main() {
 		conf.rawBytes = rawBytes
 		server.profiles[conf.Name] = conf
 		log.Printf("Loaded CNI Profile %q mapped to IPAM %q", conf.Name, conf.IPAM.Type)
+	}
+
+	if gcEnabled {
+		pools, err := managedPoolsFromProfiles(server.profiles)
+		if err != nil {
+			log.Fatalf("invalid whereabouts garbage collection configuration: %v", err)
+		}
+		if len(pools) == 0 {
+			log.Printf("Garbage collection enabled, but no whereabouts profiles were loaded")
+		} else {
+			restConfig, err := rest.InClusterConfig()
+			if err != nil {
+				log.Fatalf("failed to create in-cluster config for garbage collection: %v", err)
+			}
+			kubeClient, err := kubernetes.NewForConfig(restConfig)
+			if err != nil {
+				log.Fatalf("failed to create Kubernetes client for garbage collection: %v", err)
+			}
+			dynamicClient, err := dynamic.NewForConfig(restConfig)
+			if err != nil {
+				log.Fatalf("failed to create dynamic Kubernetes client for garbage collection: %v", err)
+			}
+			controller, err := NewGCController(kubeClient, dynamicClient, gcNamespace, pools, gcInterval, gcGracePeriod)
+			if err != nil {
+				log.Fatalf("failed to create whereabouts garbage collector: %v", err)
+			}
+			go runGCWithLeaderElection(context.Background(), kubeClient, controller, gcNamespace, gcLeaseName, gcLeaderElection)
+		}
 	}
 
 	mux := http.NewServeMux()

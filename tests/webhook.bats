@@ -57,6 +57,29 @@ teardown_file() {
   # Validate pod has IP from whereabouts range
   run kubectl exec pod-whereabouts -- ip -4 addr show
   assert_output --partial "192.168.100."
+
+  # The webhook API passes the full ResourceClaim, so whereabouts records the
+  # claim UID as the allocation identity and the real Pod as podref.
+  claim_uid="$(kubectl get resourceclaims -o json | jq -r '.items[] | select(any(.status.reservedFor[]?; .name == "pod-whereabouts")) | .metadata.uid')"
+  run kubectl -n kube-system get ippool 192.168.100.0-24 -o json
+  assert_success
+  allocation_id="$(jq -r '.spec.allocations | to_entries[] | select(.value.podref == "default/pod-whereabouts") | .value.id' <<<"$output")"
+  assert_equal "$allocation_id" "$claim_uid"
+
+  # Inject a leaked allocation whose ResourceClaim no longer exists. The
+  # webhook GC must remove it without the upstream ip-control-loop.
+  kubectl -n kube-system patch ippool 192.168.100.0-24 --type=merge \
+    -p='{"spec":{"allocations":{"200":{"id":"00000000-0000-0000-0000-000000000000","podref":"default/deleted-pod","ifname":"net1"}}}}'
+  for _ in $(seq 1 20); do
+    if ! kubectl -n kube-system get ippool 192.168.100.0-24 -o json | jq -e '.spec.allocations["200"]' >/dev/null; then
+      break
+    fi
+    sleep 2
+  done
+  run kubectl -n kube-system get ippool 192.168.100.0-24 -o json
+  assert_success
+  run jq -e '.spec.allocations["200"]' <<<"$output"
+  assert_failure
   
   kubectl delete pod pod-whereabouts
   kubectl delete resourceclaimtemplate whereabouts-claim

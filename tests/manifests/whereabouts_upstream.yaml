@@ -124,8 +124,9 @@ spec:
           - -c
           - |
             SLEEP=false source /install-cni.sh
-            /token-watcher.sh &
-            /ip-control-loop -log-level debug
+            # DRANET's whereabouts webhook owns garbage collection.
+            # Do not start the legacy whereabouts ip-control-loop reconciler.
+            exec /token-watcher.sh
         image: ghcr.io/k8snetworkplumbingwg/whereabouts:latest
         env:
         - name: NODENAME
