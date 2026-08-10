@@ -39,14 +39,14 @@ sequenceDiagram
     W-->>D: Baseline Hardware Settings (MTU, baseline routes)
     
     note over D,W: Profile Provider Phase (User Intent Resolution)
-    D->>W: POST /GetProfileConfig (Device ID, full NetworkConfig containing Profile Name)
+    D->>W: POST /GetProfileConfig (Device ID, ResourceClaim, full NetworkConfig)
     W-->>D: Logical Network Config (Assigned IPs, custom routes)
     
     note over D: DRANET merges all configs
     note over D: DRANET programs the interface statically
     
     note over D,W: Teardown Phase
-    D->>W: POST /ReleaseProfileConfig (Device ID, full NetworkConfig)
+    D->>W: POST /ReleaseProfileConfig (Device ID, ResourceClaim UID, full NetworkConfig)
     W-->>D: 200 OK (Resources released)
 ```
 
@@ -88,7 +88,7 @@ Your webhook server should implement the following HTTP `POST` endpoints based o
 
 #### Profile Provider API (`profileProvider: true`)
 
-* `POST /GetProfileConfig`: Allocates and returns the logical profile configuration (e.g., allocating an IP address from IPAM). 
+* `POST /GetProfileConfig`: Allocates and returns the logical profile configuration (e.g., allocating an IP address from IPAM). The request includes the complete `ResourceClaim`, including its UID, namespace, allocation, and `status.reservedFor` Pod consumer. Providers can therefore use the Claim UID as an idempotency key and the actual Pod namespace/name when integrating with an IPAM system.
 
   **Mutation & Validation**: The webhook receives the *entire* `NetworkConfig` (combined from user and cloud intents) as context. Unlike standard Mutating Webhooks on the API server, this node-level webhook cannot directly mutate the opaque config object in the API server. Instead, it computes and returns the *resolved profile parameters* (like the chosen IP), which DRANET then merges into the final configuration. Passing the full configuration gives the webhook the power of a Validating Admission Controller.
 
@@ -108,16 +108,20 @@ Your webhook server should implement the following HTTP `POST` endpoints based o
   * **Kubelet Retry Loops**: Standard Kubernetes behavior is to retry failed resource preparations. A persistent denial (like a 400 Bad Request) will cause the Kubelet to continuously retry `NodePrepareResources`, which can generate unnecessary load on the node and webhook server compared to an upfront API rejection.
   * **Idempotency**: The kubelet may retry `NodePrepareResources`, so DRANET can call this more than once for the same `(device, claimUID)`. It must return an equivalent result without allocating additional resources (e.g. key the allocation by `claimUID`, as `whereabouts` does via `CNI_CONTAINERID`).
 
-* `POST /ReleaseProfileConfig`: Frees stateful resources (e.g., releasing an IP address). Also receives the full `NetworkConfig`. Should return `200 OK` on success or if the resource was already released (idempotency).
+* `POST /ReleaseProfileConfig`: Frees stateful resources (e.g., releasing an IP address). It receives the ResourceClaim UID and the full `NetworkConfig`. `NodeUnprepareResources` does not provide the complete ResourceClaim. The endpoint should return `200 OK` on success or if the resource was already released (idempotency).
   * **Best-effort teardown**: A failed `ReleaseProfileConfig` is logged but not retried by DRANET (teardown must not block pod deletion). The provider therefore owns leak reclamation and must be able to garbage-collect orphaned allocations on its own, otherwise resources leak permanently.
 
 ### Reference Implementation
 
 An example implementation of a webhook profile provider that wraps the standard CNI `whereabouts` IPAM plugin is available at `cmd/webhook-whereabouts`. It acts as an independent module.
 
+The reference webhook can also garbage-collect leaked whereabouts allocations without using the upstream whereabouts `ip-control-loop` reconciler. With `--gc-enabled=true`, it derives the IPPools it owns from the loaded CNI profiles, lists live allocated ResourceClaims, and treats each whereabouts allocation `id` as a ResourceClaim UID. An allocation is removed only after it has been absent for `--gc-grace-period` and the webhook has listed ResourceClaims again immediately before updating the IPPool. ResourceClaim list failures are fail-closed. Orphaned `OverlappingRangeIPReservation` objects are reconciled from the surviving allocations as well.
+
+Run multiple webhook replicas with the default `--gc-leader-election=true`; only the Lease holder performs collection. The ServiceAccount needs cluster-wide `list` access to `resourceclaims`, update access to the managed `ippools`, delete access to `overlappingrangeipreservations`, and access to the leader-election Lease. A pool configured in these profiles must be dedicated to this webhook because all allocations in that pool are interpreted as ResourceClaim-owned allocations. The initial implementation supports the Kubernetes whereabouts datastore and does not support `node_slice_size`.
+
 You can run this reference webhook locally:
 ```bash
 cd cmd/webhook-whereabouts
 go build .
-./webhook-whereabouts --bind-address=127.0.0.1:8080
+./webhook-whereabouts --bind-address=127.0.0.1:8080 --gc-enabled=true
 ```
